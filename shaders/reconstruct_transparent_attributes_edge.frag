@@ -19,6 +19,7 @@ uniform float uCoverageBias;
 uniform float uDepthSigma;
 uniform float uAlbedoSigma;
 uniform int uLayerIndex;
+uniform int uDecoupleOpacityConfidence; // 0: archived attenuation; 1: separate alpha from confidence
 
 const float EPS = 1e-6;
 const int MAX_CANDIDATES = 8;
@@ -489,8 +490,10 @@ void main() {
     float alphaHat = clamp(decodeCoverageAlpha(encodedCoverage), 0.0, 1.0);
     // Reduce very weak layer hallucinations before composition. This is deliberately
     // conservative for low-support second-layer estimates.
-    if (uLayerIndex == 1) alphaHat *= smoothstep(0.08, 0.30, support);
-    else alphaHat *= mix(0.90, 1.0, smoothstep(0.05, 0.25, support));
+    if (uDecoupleOpacityConfidence == 0) {
+        if (uLayerIndex == 1) alphaHat *= smoothstep(0.08, 0.30, support);
+        else alphaHat *= mix(0.90, 1.0, smoothstep(0.05, 0.25, support));
+    }
 
     vec3 reconstructedNormal = refNormal;
     float normalLen2 = dot(sumNormal, sumNormal);
@@ -540,7 +543,10 @@ void main() {
         geometryConfidence *= 1.0 - 0.92 * contradiction;
     }
     geometryConfidence *= mix(0.72, 1.0, support);
-    alphaHat *= geometryConfidence;
+    if (uDecoupleOpacityConfidence == 0) alphaHat *= geometryConfidence;
+    // In the decoupled ablation, confidence remains an independent diagnostic
+    // and a hypothesis-existence guard below. Never interpret uncertain alpha
+    // as systematically smaller physical opacity.
 
     // Suppress extremely weak second-layer hallucinations. High-alpha reveal companding
     // is designed specifically to raise this support when the front layer is dense.

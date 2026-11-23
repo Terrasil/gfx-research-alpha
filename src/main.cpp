@@ -1,3 +1,7 @@
+#include "experiment_gpu_timer.hpp"
+
+#include <chrono>
+#include <stdexcept>
 #include <gfx/alpha/layered_wboit_target.hpp>
 #include <gfx/alpha/textured_obj_scene.hpp>
 #include <gfx/alpha/wboit_target.hpp>
@@ -59,6 +63,14 @@ namespace {
     constexpr int METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC = 14;
     constexpr int METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE = 15;
     constexpr int METHOD_DEPTH_PEEL_REFERENCE = 16;
+    constexpr int METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED = 17;
+    constexpr int METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED = 18;
+
+    constexpr bool edgeAwareMethod(int method) {
+        return method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE ||
+               method == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED ||
+               method == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED;
+    }
 
     constexpr int RODD_ABLATE_NONE = 0;
     constexpr int RODD_ABLATE_ORDINAL = 1 << 0;
@@ -73,7 +85,7 @@ namespace {
     constexpr int MAX_SCENE_LAYERS = MAX_TRANSPARENT_LAYERS + 1;
     constexpr int REFERENCE_PEEL_LAYERS = 24;
 
-    constexpr std::array<const char*, 17> METHOD_LABELS = {
+    constexpr std::array<const char*, 19> METHOD_LABELS = {
         "Raw coverage dither / screen-door",
         "2x2 occupancy box",
         "Local box reconstruction",
@@ -90,10 +102,12 @@ namespace {
         "Deferred sparse-layer K=2 legacy (post-lit resolve)",
         "Deferred sparse-layer K=2 isotropic + direct composite",
         "Deferred sparse-layer K=2 EDGE-AWARE + direct (proposed)",
-        "Depth-peeling alpha reference (24 layers)"
+        "Depth-peeling alpha reference (24 layers)",
+        "Deferred sparse-layer K=2 / uncoupled opacity",
+        "Deferred sparse-layer K=2 / packed materials"
     };
 
-    constexpr std::array<const char*, 17> METHOD_IDS = {
+    constexpr std::array<const char*, 19> METHOD_IDS = {
         "raw-dither",
         "occupancy-2x2",
         "box-reconstruction",
@@ -110,7 +124,9 @@ namespace {
         "deferred-sparse-layer-2-legacy",
         "deferred-sparse-layer-2-isotropic-direct",
         "deferred-sparse-layer-2-edge-aware",
-        "depth-peeling-reference-24"
+        "depth-peeling-reference-24",
+        "deferred-sparse-layer-2-edge-decoupled",
+        "deferred-sparse-layer-2-edge-packed"
     };
 
     constexpr std::array<const char*, 4> ALPHA_MODE_LABELS = {
@@ -217,6 +233,7 @@ namespace {
     struct LaunchOptions {
         bool benchmarkSuite = false;
         bool benchmarkQuick = false;
+        std::string storageStudy;
         bool benchmarkPaper = false;
         bool benchmarkEdgeDecision = false;
         std::filesystem::path benchmarkOutput = "results/benchmark";
@@ -293,6 +310,7 @@ namespace {
         double positionMax = std::numeric_limits<double>::quiet_NaN();
         double alphaRmse = std::numeric_limits<double>::quiet_NaN();
         double alphaMae = std::numeric_limits<double>::quiet_NaN();
+        double alphaBias = std::numeric_limits<double>::quiet_NaN();
         double alphaMax = std::numeric_limits<double>::quiet_NaN();
         double matchRecall = 0.0;
         double falsePositiveRatio = 0.0;
@@ -679,6 +697,7 @@ namespace {
         long double roughnessAbsolute = 0.0;
         long double positionSquared = 0.0;
         long double alphaSquared = 0.0;
+        long double alphaSigned = 0.0;
         long double alphaAbsolute = 0.0;
         std::vector<double> normalAngles;
         normalAngles.reserve(size / 16);
@@ -725,6 +744,7 @@ namespace {
                 - static_cast<double>(referenceControl[i + 1]);
             alphaSquared += alphaError * alphaError;
             alphaAbsolute += std::abs(alphaError);
+            alphaSigned += alphaError;
             result.alphaMax = std::isfinite(result.alphaMax) ? std::max(result.alphaMax, std::abs(alphaError)) : std::abs(alphaError);
 
             double rnx = static_cast<double>(reconstructedNormal[i]) * 2.0 - 1.0;
@@ -760,6 +780,7 @@ namespace {
         result.positionRmse = std::sqrt(static_cast<double>(positionSquared / n));
         result.alphaRmse = std::sqrt(static_cast<double>(alphaSquared / n));
         result.alphaMae = static_cast<double>(alphaAbsolute / n);
+        result.alphaBias = static_cast<double>(alphaSigned / n);
 
         if (!normalAngles.empty()) {
             std::sort(normalAngles.begin(), normalAngles.end());
@@ -813,7 +834,8 @@ namespace {
 
             renderWidth_ = config().width;
             renderHeight_ = config().height;
-            if (launchOptions_.benchmarkEdgeDecision) startBenchmarkSuite(false, false, false, true);
+            if (!launchOptions_.storageStudy.empty()) startBenchmarkSuite(false, false, false, false, launchOptions_.storageStudy);
+            else if (launchOptions_.benchmarkEdgeDecision) startBenchmarkSuite(false, false, false, true);
             else if (launchOptions_.benchmarkPaper) startBenchmarkSuite(true, true);
             else if (launchOptions_.benchmarkSuite || launchOptions_.benchmarkQuick) startBenchmarkSuite(!launchOptions_.benchmarkQuick);
             return true;
@@ -961,6 +983,18 @@ namespace {
                 && displayShader_.load(displayFiles);
         }
 
+        bool createLayerTargets(int width, int height, bool packed) {
+            const gfx::research::ColorAttachmentDesc attributes[] = {
+                {static_cast<GLenum>(packed ? GL_RGBA8 : GL_RGBA16F), GL_NEAREST, GL_NEAREST},
+                {static_cast<GLenum>(packed ? GL_RGB10_A2 : GL_RGBA16F), GL_NEAREST, GL_NEAREST},
+                {GL_RGBA16F, GL_NEAREST, GL_NEAREST},
+                {GL_RGBA16F, GL_NEAREST, GL_NEAREST}
+            };
+            layerTargetsPacked_ = packed;
+            return reconstructedTransparentGBuffer_.create(width,height,attributes,false)
+                && reconstructedTransparentLayer1GBuffer_.create(width,height,attributes,false);
+        }
+
         bool createTargets(const int width, const int height) {
             if (width <= 0 || height <= 0) return false;
             const gfx::research::ColorAttachmentDesc opaqueGBufferColors[] = {
@@ -991,9 +1025,8 @@ namespace {
                 && layeredSupportTarget_.create(width, height, supportColor, true, GL_DEPTH_COMPONENT32F)
                 && mixedGBuffer_.create(width, height, mixedGBufferColors, true, GL_DEPTH_COMPONENT32F)
                 && mixedLit_.create(width, height, hdrColor, false)
-                && reconstructedTransparentGBuffer_.create(width, height, mixedGBufferColors, false)
+                && createLayerTargets(width,height,method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED)
                 && reconstructedTransparentLit_.create(width, height, hdrColor, false)
-                && reconstructedTransparentLayer1GBuffer_.create(width, height, mixedGBufferColors, false)
                 && reconstructedTransparentLayer1Lit_.create(width, height, hdrColor, false)
                 && resultTarget_.create(width, height, resultColors, true, GL_DEPTH_COMPONENT32F)
                 && referenceTarget_.create(width, height, hdrColor, false)
@@ -1552,6 +1585,8 @@ namespace {
             shader.set_float("uDepthSigma", depthSigma_);
             shader.set_float("uAlbedoSigma", albedoSigma_);
             shader.set_int("uLayerIndex", layerIndex);
+            if (edgeAware) shader.set_int("uDecoupleOpacityConfidence",
+                (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED || method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED) ? 1 : 0);
             fullscreen_.draw();
             glDepthMask(GL_TRUE);
         }
@@ -2103,6 +2138,9 @@ namespace {
 
         void on_frame(const gfx::research::FrameInfo& frame) override {
             prepareBenchmarkFrame();
+            const bool packed = method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED;
+            if (packed != layerTargetsPacked_ && !createLayerTargets(renderWidth_,renderHeight_,packed))
+                throw std::runtime_error("Could not allocate reconstructed transparency layers");
             updateCamera(frame);
             const int windowWidth = frame.width;
             const int windowHeight = frame.height;
@@ -2114,7 +2152,7 @@ namespace {
                 || method_ == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                 || method_ == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                 || method_ == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                || method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                || edgeAwareMethod(method_);
             const bool needReference =
                 (benchmarkRunning_ && currentBenchmarkCase().quality) || method_ == METHOD_DEPTH_PEEL_REFERENCE;
             const bool needAlphaReference =
@@ -2123,7 +2161,7 @@ namespace {
                 && (method_ == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                     || method_ == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || method_ == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                    || edgeAwareMethod(method_));
             const bool needOverdrawDepth =
                 benchmarkRunning_ && currentBenchmarkCase().recordOverdraw && !overdrawMeasuredThisCase_;
 
@@ -2156,7 +2194,7 @@ namespace {
             else if (method_ == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION) renderDeferredAttributeReconstruction(viewProjection);
             else if (method_ == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION) renderDeferredTwoLayerReconstruction(viewProjection, false, false);
             else if (method_ == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC) renderDeferredTwoLayerReconstruction(viewProjection, false, true);
-            else if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) renderDeferredTwoLayerReconstruction(viewProjection, true, true);
+            else if (edgeAwareMethod(method_)) renderDeferredTwoLayerReconstruction(viewProjection, true, true);
             else renderProposed(viewProjection);
             gpuTimer_.end();
 
@@ -2166,9 +2204,15 @@ namespace {
         }
 
         void on_gui(const gfx::research::FrameInfo& frame) override {
-            ImGui::Begin("Deferred transparency baseline study");
+            const auto* viewport=ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos({viewport->WorkPos.x+12,viewport->WorkPos.y+12},ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize({448,std::min(800.0f,std::max(320.0f,viewport->WorkSize.y-24))},ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSizeConstraints({380,320},{650,std::max(320.0f,viewport->WorkSize.y-24)});
+            if (!ImGui::Begin("Transparency Research")) { ImGui::End(); return; }
             ImGui::Text("%.1f FPS | CPU %.3f ms | transparency GPU %.3f ms", fps(), cpu_frame_milliseconds(), gpuTimer_.milliseconds());
             ImGui::Separator();
+            if (ImGui::BeginTabBar("Sections")) {
+            if (ImGui::BeginTabItem("Method")) {
             ImGui::Combo("Method", &method_, METHOD_LABELS.data(), static_cast<int>(METHOD_LABELS.size()));
             if (method_ == METHOD_CLASSIC_FORWARD_ALPHA) ImGui::TextDisabled("Classic fixed draw order: standard alpha blending with no transparency sorting.");
             if (method_ == METHOD_SORTED_FORWARD_ALPHA) ImGui::TextDisabled("Object sorting is view-dependent and is NOT ground truth for intersections.");
@@ -2176,7 +2220,8 @@ namespace {
             if (method_ == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION) ImGui::TextDisabled("Single-layer attribute-space decoder: reconstruct material attributes first, then light and composite.");
             if (method_ == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION) ImGui::TextDisabled("Legacy K=2: isotropic reconstruction plus the v3.1 post-lighting neighborhood resolve.");
             if (method_ == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC) ImGui::TextDisabled("Ablation: previous isotropic attribute decoder, but direct composition after deferred lighting (no post-lit blur).");
-            if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) ImGui::TextDisabled("Proposed v3.2: censored K=2 + anisotropic edge support + affine position/material reproduction + direct final composition.");
+            if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) ImGui::TextDisabled("Legacy edge-aware: support/confidence attenuates radiometric alpha.");
+            if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED) ImGui::TextWrapped("Opacity decoupling ablation: confidence only controls existence and fallback, not the alpha value.");
             ImGui::Combo("Dither", &ditherMode_, DITHER_LABELS.data(), static_cast<int>(DITHER_LABELS.size()));
             ImGui::Combo("Coverage encoding", &coverageEncodingMode_, COVERAGE_ENCODING_LABELS.data(), static_cast<int>(COVERAGE_ENCODING_LABELS.size()));
             if (coverageEncodingMode_ >= 1 && coverageEncodingMode_ <= 3) ImGui::SliderFloat("Coverage bias", &coverageBias_, 0.0f, 2.0f, "%.2f");
@@ -2196,7 +2241,13 @@ namespace {
             ImGui::SliderFloat("Layered OIT depth span", &layeredDepthSpan_, 1.0f, 20.0f, "%.2f");
             if (transparentGeometry_ == 6) ImGui::SliderInt("Transparent layers", &transparentLayers_, 1, MAX_TRANSPARENT_LAYERS);
             ImGui::SliderInt("Point lights", &lightCount_, 1, 256);
+            ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Scene")) {
             ImGui::Checkbox("Sponza", &showSponza_);
+            ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Camera")) {
             ImGui::Separator();
             const glm::vec3 cameraPosition = camera_.position();
             ImGui::Text("Camera: %.2f, %.2f, %.2f", cameraPosition.x, cameraPosition.y, cameraPosition.z);
@@ -2208,10 +2259,15 @@ namespace {
             if (ImGui::Button("Reset camera")) resetCamera();
             if (sponzaLoaded_) ImGui::Text("Sponza: %zu submeshes, %zu diffuse textures", sponza_.submesh_count(), sponza_.texture_count());
             ImGui::Separator();
-            ImGui::TextWrapped("Publication-candidate v3.2: depth peeling is the quality reference. The proposed K=2 path models deeper-layer observations as censored, reconstructs transparent G-buffer attributes with anisotropic edge-aware support and local affine reproduction, then performs deferred lighting only after reconstruction. The previous isotropic K=2 path is retained as the direct ablation; WBOIT/layered WBOIT and forward alpha remain baselines.");
-            ImGui::TextWrapped("Benchmark output now also includes overdraw/depth-complexity statistics: input transparent fragments per pixel and coverage-surviving sparse samples per pixel.");
-            ImGui::Separator();
+            ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Tests")) {
             if (!benchmarkRunning_) {
+                ImGui::SeparatorText("Packed storage");
+                if (ImGui::Button("Run packed-storage smoke test")) startBenchmarkSuite(false, false, false, false, "smoke");
+                if (ImGui::Button("Run packed-storage quick suite")) startBenchmarkSuite(false, false, false, false, "quick");
+                if (ImGui::Button("Run packed-storage publication suite")) startBenchmarkSuite(false, false, false, false, "paper");
+                ImGui::SeparatorText("Transparency benchmarks");
                 if (ImGui::Button("Run known-baselines suite")) startBenchmarkSuite(false, false, true);
                 if (ImGui::Button("Run v3.2 edge GO/NO-GO")) startBenchmarkSuite(false, false, false, true);
                 if (ImGui::Button("Run quick benchmark suite")) startBenchmarkSuite(false);
@@ -2223,7 +2279,12 @@ namespace {
                 ImGui::TextWrapped("%s", currentBenchmarkCase().pairId.c_str());
                 if (ImGui::Button("Stop suite")) stopBenchmarkSuite(false);
             }
+            if (!benchmarkOutput_.empty()) ImGui::TextWrapped("Output: %s", benchmarkOutput_.string().c_str());
             ImGui::Text("Window: %d x %d", frame.width, frame.height);
+            ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+            }
             ImGui::End();
         }
 
@@ -2231,14 +2292,20 @@ namespace {
             const bool full,
             const bool paperOnly = false,
             const bool baselineOnly = false,
-            const bool edgeDecisionOnly = false
+            const bool edgeDecisionOnly = false,
+            const std::string_view storageStudy = {}
         ) {
             resetCamera();
-            benchmarkCases_ = edgeDecisionOnly
+            benchmarkCases_ = !storageStudy.empty() ? makeStorageCases(storageStudy) : edgeDecisionOnly
                 ? makeEdgeDecisionBenchmarkCases()
                 : (baselineOnly ? makeBaselineBenchmarkCases() : (paperOnly ? makePaperBenchmarkCases() : makeBenchmarkCases(full)));
             if (benchmarkCases_.empty()) return;
             benchmarkOutput_ = launchOptions_.benchmarkOutput;
+            if (!storageStudy.empty() && launchOptions_.storageStudy.empty())
+                benchmarkOutput_ /= "storage-" + std::string(storageStudy) + "-"
+                    + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+            if (!storageStudy.empty() && std::filesystem::exists(benchmarkOutput_) && !std::filesystem::is_empty(benchmarkOutput_))
+                throw std::runtime_error("Choose an empty storage study output directory");
             std::filesystem::create_directories(benchmarkOutput_ / "captures");
             benchmarkRaw_.open(benchmarkOutput_ / "timing_raw.csv", std::ios::trunc);
             benchmarkSummary_.open(benchmarkOutput_ / "timing_summary.csv", std::ios::trunc);
@@ -2255,10 +2322,12 @@ namespace {
             benchmarkRaw_ << "pair_id,sweep,repeat,method,rodd_variant,width,height,lights,alpha_mode,dither,coverage_encoding,coverage_bias,kernel_radius,geometry,layers,alpha,depth_sigma,albedo_sigma,wboit_depth_exponent,layer_span,sample,gpu_ms,deferred_lighting_ms\n";
             benchmarkSummary_ << "pair_id,sweep,repeat,method,rodd_variant,width,height,lights,alpha_mode,dither,coverage_encoding,coverage_bias,kernel_radius,geometry,layers,alpha,depth_sigma,albedo_sigma,wboit_depth_exponent,layer_span,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,deferred_lighting_mean_ms,deferred_lighting_median_ms,deferred_lighting_stddev_ms,deferred_lighting_p95_ms,deferred_lighting_min_ms,deferred_lighting_max_ms\n";
             benchmarkQuality_ << "pair_id,sweep,method,rodd_variant,width,height,lights,alpha_mode,dither,coverage_encoding,coverage_bias,kernel_radius,geometry,layers,alpha,depth_sigma,albedo_sigma,wboit_depth_exponent,layer_span,color_rmse,color_relative_rmse,color_psnr,color_max_abs,global_ssim,gradient_rmse,gradient_relative_rmse,gradient_transfer,ordered_phase_residual_ratio,coverage_rmse,coverage_mae,coverage_max_abs,alpha_rmse,alpha_mae,alpha_max_abs,alpha_samples\n";
-            benchmarkAttributeQuality_ << "pair_id,sweep,method,layer,width,height,lights,alpha,dither,coverage_encoding,kernel_radius,geometry,reference_samples,predicted_samples,matched_samples,match_recall,false_positive_ratio,wrong_surface_samples,albedo_rmse,normal_mean_deg,normal_median_deg,normal_p95_deg,roughness_rmse,roughness_mae,position_rmse,position_max,alpha_rmse,alpha_mae,alpha_max\n";
+            benchmarkAttributeQuality_ << "pair_id,sweep,method,layer,width,height,lights,alpha,dither,coverage_encoding,kernel_radius,geometry,reference_samples,predicted_samples,matched_samples,match_recall,false_positive_ratio,wrong_surface_samples,albedo_rmse,normal_mean_deg,normal_median_deg,normal_p95_deg,roughness_rmse,roughness_mae,position_rmse,position_max,alpha_rmse,alpha_mae,alpha_max,alpha_signed_mean\n";
             benchmarkOverdraw_ << "pair_id,sweep,method,rodd_variant,width,height,lights,alpha_mode,dither,coverage_encoding,coverage_bias,kernel_radius,geometry,layers,alpha,input_mean_fragments,input_max_fragments,coverage_surviving_mean_fragments,coverage_surviving_max_fragments,coverage_survival_ratio,covered_pixel_ratio\n";
             const glm::vec3 cameraPosition = camera_.position();
             benchmarkManifest_
+                << "storage_study=" << storageStudy << '\n'
+                << "planned_cases=" << benchmarkCases_.size() << '\n'
                 << "study=censored-sparse-layer-edge-aware-v3.2\n"
                 << "gpu_vendor=" << glString(GL_VENDOR) << '\n'
                 << "gpu_renderer=" << glString(GL_RENDERER) << '\n'
@@ -2339,7 +2408,7 @@ namespace {
             transparentMotionOffset_ = glm::vec3(0.0f);
             resetCamera(false);
             if (completed && (launchOptions_.benchmarkSuite || launchOptions_.benchmarkQuick || launchOptions_.benchmarkPaper
-                || launchOptions_.benchmarkEdgeDecision)) {
+                || launchOptions_.benchmarkEdgeDecision || !launchOptions_.storageStudy.empty())) {
                 glfwSetWindowShouldClose(window(), GLFW_TRUE);
             }
             benchmarkSamples_.clear();
@@ -2387,6 +2456,8 @@ namespace {
                 renderHeight_ = test.targetHeight;
                 createTargets(renderWidth_, renderHeight_);
             }
+            gpuTimer_.reset();
+            deferredLightingTimer_.reset();
             benchmarkWarmupRemaining_ = test.warmupFrames;
             benchmarkSampleIndex_ = 0;
             benchmarkSamples_.clear();
@@ -2505,7 +2576,7 @@ namespace {
                     if (test.method == METHOD_CONTROL_GUIDED_ANISOTROPIC || test.method == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                         || test.method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                         || test.method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                        || test.method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) {
+                        || edgeAwareMethod(test.method)) {
                         for (std::size_t i = 0; i + 3 < continuousAlphaMeta.size(); i += 4) continuousAlphaMeta[i] = continuousAlphaMeta[i + 3];
                     }
                     if (continuousAlphaReferenceValid) {
@@ -2533,7 +2604,7 @@ namespace {
             const bool oneLayer = test.method == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION;
             const bool twoLayer = test.method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                 || test.method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                || test.method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                || edgeAwareMethod(test.method);
             if (!oneLayer && !twoLayer) return;
 
             const auto writeLayer = [&](const int layer, gfx::research::Framebuffer& reconstructed, gfx::research::Framebuffer& reference) {
@@ -2559,7 +2630,7 @@ namespace {
                     << metrics.normalMeanDegrees << ',' << metrics.normalMedianDegrees << ',' << metrics.normalP95Degrees << ','
                     << metrics.roughnessRmse << ',' << metrics.roughnessMae << ','
                     << metrics.positionRmse << ',' << metrics.positionMax << ','
-                    << metrics.alphaRmse << ',' << metrics.alphaMae << ',' << metrics.alphaMax << '\n';
+                    << metrics.alphaRmse << ',' << metrics.alphaMae << ',' << metrics.alphaMax << ',' << metrics.alphaBias << '\n';
             };
 
             writeLayer(0, reconstructedTransparentGBuffer_, attributeReferenceFront_);
@@ -2635,7 +2706,7 @@ namespace {
 
             if (test.method != METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                 && test.method != METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                && test.method != METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) return;
+                && !edgeAwareMethod(test.method)) return;
 
             saveAttachmentCapture(
                 mixedGBuffer_, 3, mixedGBuffer_.color(3),
@@ -2755,7 +2826,7 @@ namespace {
                 const int alphaChannel = (test.method == METHOD_CONTROL_GUIDED_ANISOTROPIC || test.method == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                     || test.method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || test.method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || test.method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) ? 3 : 0;
+                    || edgeAwareMethod(test.method)) ? 3 : 0;
                 saveTextureChannelPfm(
                     benchmarkOutput_ / "captures" / (stem + "-alpha-estimate.pfm"),
                     resultTarget_.color(1), renderWidth_, renderHeight_, alphaChannel
@@ -3561,6 +3632,49 @@ namespace {
             return cases;
         }
 
+        std::vector<BenchmarkCase> makeStorageCases(std::string_view profile) const {
+            std::vector<BenchmarkCase> cases;
+            constexpr std::array methods{METHOD_WBOIT,METHOD_LAYERED_WBOIT,METHOD_SORTED_FORWARD_ALPHA,
+                METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED,
+                METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED};
+            const bool smoke=profile=="smoke", paper=profile=="paper";
+            const std::vector<int> geometries=smoke?std::vector{3}:std::vector{0,1,2,3,4,5,6};
+            const std::vector<float> alphas=smoke?std::vector{0.75f}:std::vector{0.35f,0.75f,0.875f};
+            const std::vector<int> lightCounts=paper?std::vector{16,64}:std::vector{smoke?4:16};
+            const int repeats=smoke?1:paper?5:2;
+            for (int geometry : geometries) for (float alpha : alphas) for (int lights : lightCounts) {
+                const std::vector<int> layerCounts=geometry==6?std::vector{2,4,8}:std::vector{1};
+                for (int layers : layerCounts) for (int repeat=0;repeat<repeats;++repeat) {
+                    const auto shift=(static_cast<std::size_t>(geometry)+repeat)%methods.size();
+                    for (std::size_t i=0;i<methods.size();++i) {
+                        BenchmarkCase test;
+                        test.method=methods[(shift+(repeat%2?methods.size()-1-i:i))%methods.size()];
+                        test.pairId=std::string(TRANSPARENT_GEOMETRY_IDS[geometry])+"-a"+scalarToken(alpha)
+                            +"-d"+std::to_string(layers)+"-l"+std::to_string(lights);
+                        test.sweep="storage-study";
+                        test.repeat=repeat;
+                        test.alpha=alpha;
+                        test.ditherMode=1;
+                        test.coverageEncodingMode=0;
+                        test.coverageBias=0.f;
+                        test.kernelRadius=2;
+                        test.lightCount=lights;
+                        test.transparentGeometry=geometry;
+                        test.transparentLayers=layers;
+                        test.targetWidth=smoke?320:paper?1280:640;
+                        test.targetHeight=smoke?180:paper?720:360;
+                        test.warmupFrames=smoke?2:paper?12:4;
+                        test.sampleFrames=smoke?3:paper?32:8;
+                        test.quality=repeat==0;
+                        test.capture=repeat==0 && geometry==3 && alpha==0.75f && lights==lightCounts.front();
+                        test.recordDeferredLighting=edgeAwareMethod(test.method);
+                        cases.push_back(std::move(test));
+                    }
+                }
+            }
+            return cases;
+        }
+
         std::vector<BenchmarkCase> makeEdgeDecisionBenchmarkCases() const {
             std::vector<BenchmarkCase> cases;
             constexpr int qualityWarmup = 12;
@@ -3581,7 +3695,7 @@ namespace {
                 test.ditherMode = 1; // stable hash: no Bayer lattice in the decision test.
                 const bool sparseTwoLayer = method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                    || edgeAwareMethod(method);
                 const bool useHighAlphaReveal = sparseTwoLayer && geometry == 6 && layers >= 4 && alpha > 0.5f;
                 test.coverageEncodingMode = useHighAlphaReveal ? 5 : 0;
                 test.coverageBias = useHighAlphaReveal ? 1.5f : 0.0f;
@@ -3594,11 +3708,11 @@ namespace {
                 test.capture = capture;
                 test.captureStages = capture && (method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
-                test.recordOverdraw = method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                    || edgeAwareMethod(method));
+                test.recordOverdraw = edgeAwareMethod(method);
                 test.recordDeferredLighting = method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                    || edgeAwareMethod(method);
                 cases.push_back(test);
             };
 
@@ -3611,7 +3725,8 @@ namespace {
                     METHOD_LAYERED_WBOIT,
                     METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION,
                     METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC,
-                    METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED
                 }) {
                     addQuality(id, method, 3, 1, alpha, true);
                 }
@@ -3623,7 +3738,8 @@ namespace {
                 METHOD_LAYERED_WBOIT,
                 METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION,
                 METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC,
-                METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE
+                METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED
             }) {
                 addQuality("v32-stack4-a0p750", method, 6, 4, 0.75f, true);
             }
@@ -3644,7 +3760,8 @@ namespace {
                     METHOD_LAYERED_WBOIT,
                     METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION,
                     METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC,
-                    METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED
                 }) {
                     BenchmarkCase test;
                     test.pairId = "v32-perf-depth-step-r" + std::to_string(repeat);
@@ -3666,7 +3783,7 @@ namespace {
                     test.sampleFrames = timingSamples;
                     test.recordDeferredLighting = method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                         || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                        || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                        || edgeAwareMethod(method);
                     cases.push_back(test);
                 }
             }
@@ -3723,7 +3840,7 @@ namespace {
                     || method == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                     || method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                    || edgeAwareMethod(method);
                 cases.push_back(test);
             };
 
@@ -3739,7 +3856,8 @@ namespace {
                             METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION,
                             METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION,
                             METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC,
-                            METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE
+                            METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED
                         }) {
                             const std::string id = std::string("pub-single-") + TRANSPARENT_GEOMETRY_IDS[geometry]
                                 + "-" + DITHER_IDS[dither] + "-a" + scalarToken(alpha);
@@ -3748,12 +3866,12 @@ namespace {
                                 && (method == METHOD_CONTROL_GUIDED_ANISOTROPIC
                                     || method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                                    || edgeAwareMethod(method));
                             addQuality(id, "publication-single-quality", method, geometry, alpha, dither, 0, 0.0f, 64, 2,
                                 keyCapture, keyCapture,
                                 method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                                     || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                                    || edgeAwareMethod(method));
                         }
                     }
 
@@ -3790,9 +3908,9 @@ namespace {
                     const bool capture = lights == 256 && (method == METHOD_CLASSIC_FORWARD_ALPHA
                         || method == METHOD_WBOIT
                         || method == METHOD_LAYERED_WBOIT
-                        || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                        || edgeAwareMethod(method));
                     addQuality(id, "publication-lighting-quality", method, 1, 0.5f, 1, 0, 0.0f, lights, 2,
-                        capture, capture && method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                        capture, capture && edgeAwareMethod(method),
                         false);
                 }
             }
@@ -3824,10 +3942,10 @@ namespace {
                                     || method == METHOD_SORTED_FORWARD_ALPHA
                                     || method == METHOD_WBOIT
                                     || method == METHOD_LAYERED_WBOIT
-                                    || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                                    || edgeAwareMethod(method));
                             addQuality(id, "publication-overlap-quality", method, geometry, alpha, dither, 0, 0.0f, 64, 2,
-                                capture, capture && method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
-                                method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE);
+                                capture, capture && edgeAwareMethod(method),
+                                edgeAwareMethod(method));
                         }
                     }
 
@@ -3884,7 +4002,7 @@ namespace {
                         test.ditherMode = 1;
                         const bool sparseTwoLayer = method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                             || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                            || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                            || edgeAwareMethod(method);
                         test.coverageEncodingMode = sparseTwoLayer && alpha > 0.5f ? 5 : 0;
                         test.coverageBias = test.coverageEncodingMode == 5 ? 1.5f : 0.0f;
                         test.kernelRadius = 2;
@@ -3894,7 +4012,7 @@ namespace {
                         test.sampleFrames = qualitySamples;
                         test.quality = true;
                         test.capture = layers == 4 && std::abs(alpha - 0.75f) < 1e-6f;
-                        test.recordOverdraw = method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                        test.recordOverdraw = edgeAwareMethod(method);
                         test.recordDeferredLighting = sparseTwoLayer;
                         cases.push_back(test);
                     }
@@ -3930,7 +4048,7 @@ namespace {
                             test.ditherMode = 1;
                             const bool sparseTwoLayer = method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                                 || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                                || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                                || edgeAwareMethod(method);
                             test.coverageEncodingMode = sparseTwoLayer ? 5 : 0;
                             test.coverageBias = test.coverageEncodingMode == 5 ? 1.5f : 0.0f;
                             test.kernelRadius = 2;
@@ -3939,12 +4057,12 @@ namespace {
                             test.warmupFrames = timingWarmup;
                             test.sampleFrames = timingSamples;
                             test.quality = false;
-                            test.recordOverdraw = method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE && repeat == 0;
+                            test.recordOverdraw = edgeAwareMethod(method) && repeat == 0;
                             test.recordDeferredLighting = method == METHOD_CONTROL_GUIDED_ANISOTROPIC
                                 || method == METHOD_DEFERRED_ATTRIBUTE_RECONSTRUCTION
                                 || method == METHOD_DEFERRED_TWO_LAYER_RECONSTRUCTION
                                 || method == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC
-                                || method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE;
+                                || edgeAwareMethod(method);
                             cases.push_back(test);
                         }
                     }
@@ -4005,8 +4123,9 @@ namespace {
         gfx::alpha::WboitTarget wboitTarget_;
         gfx::alpha::LayeredWboitTarget layeredWboitTarget_;
         gfx::research::FullscreenTriangle fullscreen_;
-        gfx::research::GpuTimer gpuTimer_;
-        gfx::research::GpuTimer deferredLightingTimer_;
+        bool layerTargetsPacked_ = false;
+        ExperimentGpuTimer gpuTimer_;
+        ExperimentGpuTimer deferredLightingTimer_;
         gfx::research::Mesh plane_;
         gfx::research::Mesh card_;
         gfx::research::Mesh sphere_;
@@ -4076,6 +4195,11 @@ namespace {
             else if (argument == "--benchmark-quick") options.benchmarkQuick = true;
             else if (argument == "--benchmark-paper" || argument == "--benchmark-publication") options.benchmarkPaper = true;
             else if (argument == "--benchmark-edge-decision") options.benchmarkEdgeDecision = true;
+            else if (argument.starts_with("--benchmark-storage-study=")) {
+                options.storageStudy = argument.substr(std::string_view("--benchmark-storage-study=").size());
+                if (options.storageStudy!="smoke" && options.storageStudy!="quick" && options.storageStudy!="paper")
+                    throw std::runtime_error("Storage study profile must be smoke, quick, or paper");
+            }
             else if (argument.starts_with("--benchmark-output=")) {
                 options.benchmarkOutput = std::string(argument.substr(std::string_view("--benchmark-output=").size()));
             }

@@ -43,6 +43,22 @@ METHODS = {
         "extra_bpp": RGBA16F + R16F,
         "note": "RGBA16F accumulation + R16F revealage",
     },
+    "object-sorted-forward": {
+        "extra_bpp": 0,
+        "note": "object sorting requires no additional per-pixel transparency attachment",
+    },
+    "deferred-sparse-layer-2-edge-aware": {
+        "extra_bpp": 4 * RGBA16F + D32F + 2 * (5 * RGBA16F),
+        "note": "mixed G-buffer plus two reconstructed G-buffers and lighting targets",
+    },
+    "deferred-sparse-layer-2-edge-decoupled": {
+        "extra_bpp": 4 * RGBA16F + D32F + 2 * (5 * RGBA16F),
+        "note": "same storage as the coupled reconstruction",
+    },
+    "deferred-sparse-layer-2-edge-packed": {
+        "extra_bpp": 4 * RGBA16F + D32F + 2 * (3 * RGBA16F + RGBA8 + 4),
+        "note": "packed RGBA8 albedo/roughness and RGB10_A2 normal/validity in each reconstructed layer",
+    },
     "layered-wboit-8": {
         "extra_bpp": 8 * (RGBA16F + R16F) + R16F + R32F + RGBA8 + D32F,
         "note": "8x accumulation/revealage + global revealage + R32F/RGBA8/D32F support target used by this harness",
