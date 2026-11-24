@@ -20,6 +20,7 @@ uniform float uDepthSigma;
 uniform float uAlbedoSigma;
 uniform int uLayerIndex;
 uniform int uDecoupleOpacityConfidence; // 0: archived attenuation; 1: separate alpha from confidence
+uniform int uOpacityEstimator; // 0: threshold/censor inference, 1: raw occupancy, 2: conditional occupancy, 3: exposure-aware ordinal blend
 
 const float EPS = 1e-6;
 const int MAX_CANDIDATES = 8;
@@ -485,7 +486,27 @@ void main() {
     float inversionTrust = clamp(ordinalEvidence / max(totalSpatialWeight, EPS), 0.0, 1.0);
     inversionTrust *= clamp(sampleCount / 4.0, 0.0, 1.0);
     if (uDitherMode != 1) inversionTrust *= 0.85;
-    encodedCoverage = mix(observedSelected, encodedCoverage, clamp(0.35 + 0.50 * inversionTrust, 0.0, 1.0));
+    // Experimental exposure-aware ordinal blend. Identical to Decoupled except
+    // the back-layer prior is conditioned on the observed non-front support.
+    // Do not change the historical blend, confidence or layer existence rules.
+    float occupancyPrior = observedSelected;
+    if (uOpacityEstimator == 3 && uLayerIndex == 1 && frontIndex >= 0) {
+        occupancyPrior = clamp(scores[selectedIndex] / max(totalSpatialWeight - scores[frontIndex], EPS), 0.0, 1.0);
+    }
+    encodedCoverage = mix(occupancyPrior, encodedCoverage, clamp(0.35 + 0.50 * inversionTrust, 0.0, 1.0));
+
+    // Isolated ablations of known-threshold inference. These controls use precisely
+    // the same candidates, material reconstruction and compositing as the decoupled
+    // decoder. Only the opacity estimator differs.
+    // RAW is deliberately exposure-biased when a front surface censors the back.
+    // CONDITIONAL corrects that exposure using only observed occupancy, without
+    // using any per-pixel threshold inequalities (not an oracle).
+    if (uOpacityEstimator == 1) {
+        encodedCoverage = observedSelected;
+    } else if (uOpacityEstimator == 2) {
+        encodedCoverage = uLayerIndex == 0 ? observedFront
+            : clamp(scores[backIndex] / max(totalSpatialWeight - scores[frontIndex], EPS), 0.0, 1.0);
+    }
 
     float alphaHat = clamp(decodeCoverageAlpha(encodedCoverage), 0.0, 1.0);
     // Reduce very weak layer hallucinations before composition. This is deliberately

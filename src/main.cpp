@@ -65,11 +65,17 @@ namespace {
     constexpr int METHOD_DEPTH_PEEL_REFERENCE = 16;
     constexpr int METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED = 17;
     constexpr int METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED = 18;
+    constexpr int METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW = 19;
+    constexpr int METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL = 20;
+    constexpr int METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL = 21;
 
     constexpr bool edgeAwareMethod(int method) {
         return method == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE ||
                method == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED ||
-               method == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED;
+               method == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED ||
+               method == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW ||
+               method == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL ||
+               method == METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL;
     }
 
     constexpr int RODD_ABLATE_NONE = 0;
@@ -85,7 +91,7 @@ namespace {
     constexpr int MAX_SCENE_LAYERS = MAX_TRANSPARENT_LAYERS + 1;
     constexpr int REFERENCE_PEEL_LAYERS = 24;
 
-    constexpr std::array<const char*, 19> METHOD_LABELS = {
+    constexpr std::array<const char*, 22> METHOD_LABELS = {
         "Raw coverage dither / screen-door",
         "2x2 occupancy box",
         "Local box reconstruction",
@@ -104,10 +110,13 @@ namespace {
         "Deferred sparse-layer K=2 EDGE-AWARE + direct (proposed)",
         "Depth-peeling alpha reference (24 layers)",
         "Deferred sparse-layer K=2 / uncoupled opacity",
-        "Deferred sparse-layer K=2 / packed materials"
+        "Deferred sparse-layer K=2 / packed materials",
+        "Opacity control: raw observed occupancy (final alpha rule)",
+        "Opacity control: exposure-corrected occupancy (final alpha rule)",
+        "Proposed: exposure-corrected ordinal blend (experimental)"
     };
 
-    constexpr std::array<const char*, 19> METHOD_IDS = {
+    constexpr std::array<const char*, 22> METHOD_IDS = {
         "raw-dither",
         "occupancy-2x2",
         "box-reconstruction",
@@ -126,7 +135,10 @@ namespace {
         "deferred-sparse-layer-2-edge-aware",
         "depth-peeling-reference-24",
         "deferred-sparse-layer-2-edge-decoupled",
-        "deferred-sparse-layer-2-edge-packed"
+        "deferred-sparse-layer-2-edge-packed",
+        "deferred-sparse-layer-2-occupancy-raw",
+        "deferred-sparse-layer-2-occupancy-conditional",
+        "deferred-sparse-layer-2-exposure-ordinal"
     };
 
     constexpr std::array<const char*, 4> ALPHA_MODE_LABELS = {
@@ -1586,7 +1598,14 @@ namespace {
             shader.set_float("uAlbedoSigma", albedoSigma_);
             shader.set_int("uLayerIndex", layerIndex);
             if (edgeAware) shader.set_int("uDecoupleOpacityConfidence",
-                (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED || method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED) ? 1 : 0);
+                (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED || method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED
+                 || method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW
+                 || method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL
+                 || method_ == METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL) ? 1 : 0);
+            if (edgeAware) shader.set_int("uOpacityEstimator",
+                method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW ? 1 :
+                method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL ? 2 :
+                method_ == METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL ? 3 : 0);
             fullscreen_.draw();
             glDepthMask(GL_TRUE);
         }
@@ -2222,6 +2241,9 @@ namespace {
             if (method_ == METHOD_DEFERRED_TWO_LAYER_DIRECT_ISOTROPIC) ImGui::TextDisabled("Ablation: previous isotropic attribute decoder, but direct composition after deferred lighting (no post-lit blur).");
             if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE) ImGui::TextDisabled("Legacy edge-aware: support/confidence attenuates radiometric alpha.");
             if (method_ == METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED) ImGui::TextWrapped("Opacity decoupling ablation: confidence only controls existence and fallback, not the alpha value.");
+            if (method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW) ImGui::TextWrapped("Control: final alpha uses raw occupancy; shared threshold-based support remains.");
+            if (method_ == METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL) ImGui::TextWrapped("Control: final back alpha uses exposure-corrected occupancy; shared threshold-based support remains.");
+            if (method_ == METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL) ImGui::TextWrapped("Experimental: Decoupled with the back-layer prior conditioned on non-front exposure.");
             ImGui::Combo("Dither", &ditherMode_, DITHER_LABELS.data(), static_cast<int>(DITHER_LABELS.size()));
             ImGui::Combo("Coverage encoding", &coverageEncodingMode_, COVERAGE_ENCODING_LABELS.data(), static_cast<int>(COVERAGE_ENCODING_LABELS.size()));
             if (coverageEncodingMode_ >= 1 && coverageEncodingMode_ <= 3) ImGui::SliderFloat("Coverage bias", &coverageBias_, 0.0f, 2.0f, "%.2f");
@@ -2267,6 +2289,11 @@ namespace {
                 if (ImGui::Button("Run packed-storage smoke test")) startBenchmarkSuite(false, false, false, false, "smoke");
                 if (ImGui::Button("Run packed-storage quick suite")) startBenchmarkSuite(false, false, false, false, "quick");
                 if (ImGui::Button("Run packed-storage publication suite")) startBenchmarkSuite(false, false, false, false, "paper");
+                ImGui::SeparatorText("Opacity / censoring ablation");
+                if (ImGui::Button("Run opacity smoke test")) startBenchmarkSuite(false, false, false, false, "opacity-smoke");
+                if (ImGui::Button("Run opacity publication test")) startBenchmarkSuite(false, false, false, false, "opacity-paper");
+                if (ImGui::Button("Run exposure-ordinal smoke")) startBenchmarkSuite(false, false, false, false, "hybrid-smoke");
+                if (ImGui::Button("Run exposure-ordinal publication test")) startBenchmarkSuite(false, false, false, false, "hybrid-paper");
                 ImGui::SeparatorText("Transparency benchmarks");
                 if (ImGui::Button("Run known-baselines suite")) startBenchmarkSuite(false, false, true);
                 if (ImGui::Button("Run v3.2 edge GO/NO-GO")) startBenchmarkSuite(false, false, false, true);
@@ -2354,7 +2381,11 @@ namespace {
                 << "coverage_encoding_modes=identity,foreground-biased,background-biased,complementary-codesign,balanced-logit-companding;all-nonidentity-transforms-are-invertible-before-physical-alpha-reconstruction\n"
                 << "kernel_radii=1,2,3\n"
                 << "quality_reference=front-to-back-depth-peeling;max_reference_layers=" << REFERENCE_PEEL_LAYERS << ";classic-forward-and-object-sorted-forward-are-baselines-not-ground-truth\n"
-                << "methods=depth-peeling-reference-24,classic-forward-fixed-order,object-sorted-forward,wboit,layered-wboit-8,raw-dither,occupancy-2x2,box-reconstruction,gaussian-reconstruction,joint-bilateral-gbuffer,two-component-affine,rodd-experimental,mixed-deferred-raw-control,deferred-attribute-reconstruction,deferred-sparse-layer-2-legacy,deferred-sparse-layer-2-isotropic-direct,deferred-sparse-layer-2-edge-aware\n"
+                << "methods=" << (storageStudy == "hybrid-smoke" || storageStudy == "hybrid-paper"
+                    ? "deferred-sparse-layer-2-edge-aware,deferred-sparse-layer-2-edge-decoupled,deferred-sparse-layer-2-occupancy-raw,deferred-sparse-layer-2-occupancy-conditional,deferred-sparse-layer-2-exposure-ordinal"
+                    : storageStudy == "opacity-smoke" || storageStudy == "opacity-paper"
+                    ? "deferred-sparse-layer-2-edge-aware,deferred-sparse-layer-2-edge-decoupled,deferred-sparse-layer-2-occupancy-raw,deferred-sparse-layer-2-occupancy-conditional"
+                    : "depth-peeling-reference-24,classic-forward-fixed-order,object-sorted-forward,wboit,layered-wboit-8,raw-dither,occupancy-2x2,box-reconstruction,gaussian-reconstruction,joint-bilateral-gbuffer,two-component-affine,rodd-experimental,mixed-deferred-raw-control,deferred-attribute-reconstruction,deferred-sparse-layer-2-legacy,deferred-sparse-layer-2-isotropic-direct,deferred-sparse-layer-2-edge-aware") << '\n'
                 << "proposed_pipeline=edge-aware-k2;opaque-reference-plus-dithered-transparent-mixed-gbuffer->censored-two-layer-attribute-reconstruction->deferred-lighting-of-reconstructed-layers->confidence-guided-composition\n"
                 << "reconstruction_proposed=censored-known-threshold-alpha-inference+surface-id-and-depth-gating+anisotropic-edge-support+local-affine-position-and-material-reproduction+normal-renormalization+geometry-consistency-rejection\n"
                 << "rodd_ablation_bits=1:no-ordinal,2:no-censored-negatives,4:no-geometry-gating,8:no-rank-conditioning,16:no-moment-reproduction,32:no-directional-pairs,64:no-confidence-guard\n"
@@ -3634,10 +3665,19 @@ namespace {
 
         std::vector<BenchmarkCase> makeStorageCases(std::string_view profile) const {
             std::vector<BenchmarkCase> cases;
-            constexpr std::array methods{METHOD_WBOIT,METHOD_LAYERED_WBOIT,METHOD_SORTED_FORWARD_ALPHA,
-                METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED,
-                METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED};
-            const bool smoke=profile=="smoke", paper=profile=="paper";
+            const bool hybrid=profile=="hybrid-smoke" || profile=="hybrid-paper";
+            const bool opacity=hybrid || profile=="opacity-smoke" || profile=="opacity-paper";
+            std::vector<int> methods=opacity
+                ? std::vector<int>{METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED,
+                    METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_RAW,
+                    METHOD_DEFERRED_TWO_LAYER_OCCUPANCY_CONDITIONAL}
+                : std::vector<int>{METHOD_WBOIT,METHOD_LAYERED_WBOIT,METHOD_SORTED_FORWARD_ALPHA,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_AWARE,METHOD_DEFERRED_TWO_LAYER_EDGE_DECOUPLED,
+                    METHOD_DEFERRED_TWO_LAYER_EDGE_PACKED};
+            if (hybrid) methods.push_back(METHOD_DEFERRED_TWO_LAYER_EXPOSURE_ORDINAL);
+            const bool smoke=profile=="smoke" || profile=="opacity-smoke" || profile=="hybrid-smoke";
+            const bool paper=profile=="paper" || profile=="opacity-paper" || profile=="hybrid-paper";
             const std::vector<int> geometries=smoke?std::vector{3}:std::vector{0,1,2,3,4,5,6};
             const std::vector<float> alphas=smoke?std::vector{0.75f}:std::vector{0.35f,0.75f,0.875f};
             const std::vector<int> lightCounts=paper?std::vector{16,64}:std::vector{smoke?4:16};
@@ -4197,8 +4237,10 @@ namespace {
             else if (argument == "--benchmark-edge-decision") options.benchmarkEdgeDecision = true;
             else if (argument.starts_with("--benchmark-storage-study=")) {
                 options.storageStudy = argument.substr(std::string_view("--benchmark-storage-study=").size());
-                if (options.storageStudy!="smoke" && options.storageStudy!="quick" && options.storageStudy!="paper")
-                    throw std::runtime_error("Storage study profile must be smoke, quick, or paper");
+                if (options.storageStudy!="smoke" && options.storageStudy!="quick" && options.storageStudy!="paper"
+                    && options.storageStudy!="opacity-smoke" && options.storageStudy!="opacity-paper"
+                    && options.storageStudy!="hybrid-smoke" && options.storageStudy!="hybrid-paper")
+                    throw std::runtime_error("Unknown storage/opacity study profile");
             }
             else if (argument.starts_with("--benchmark-output=")) {
                 options.benchmarkOutput = std::string(argument.substr(std::string_view("--benchmark-output=").size()));
